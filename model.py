@@ -5,6 +5,10 @@ References:
 https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+
+
+Updating Model definition to include: 
+1) variations of the attention mechanism that have been shown to illiminate attention sinks
 """
 
 import math
@@ -41,38 +45,54 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        self.attention_type = config.attention_type
+    
+        # base causal mask to ensure that attention is only applied to the left in the input sequence
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
+        kv_bias = (self.attention_type in ["key_bias", "key_value_bias"])
+        if kv_bias:
+            self.key_bias = nn.Parameter(torch.zeros(self.n_embd), requires_grad=True)
+            if self.attention_type == "key_value_bias":
+                self.value_bias = nn.Parameter(torch.zeros(self.n_embd), requires_grad=True)           
+            mask = torch.cat((torch.ones(config.block_size,1), mask), dim=1) # add col of ones for extra bias
+        self.register_buffer("bool_mask", (mask == 1))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        T_q = T 
+        T_kv = T
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) # 3x(B,T,n_embed)
+        if self.attention_type in ["key_bias", "key_value_bias"]:
+            key_bias = self.key_bias.unsqueeze(0).unsqueeze(0).expand(B,1,C)
+            if self.attention_type == "key_value_bias":
+                value_bias = self.value_bias.unsqueeze(0).unsqueeze(0).expand(B,1,C)
+            else:
+                value_bias = torch.zeros(size=(B,1,C), device=x.device)
+            k = torch.cat((key_bias, k), dim=1)
+            v = torch.cat((value_bias, v), dim=1)
+            T_kv += 1
+        
+        q = q.view(B, T_q, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_q, hs)
+        k = k.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
+        v = v.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
+        # causal self-attention; Self-attend: (B, nh, T_q, hs) x (B, nh, hs, T_kv) -> (B, nh, T_q, T_kv)
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=self.bool_mask[:T_q,:T_kv], 
+                                                             dropout_p=self.dropout if self.training else 0, is_causal=False)
+        
+        ''' manual implementation of attention for debugging
+        if True: 
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.bool_mask.unsqueeze(0).unsqueeze(0)[:,:,:T_q,:T_kv] == False, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
+            y_test = att @ v # (B, nh, T_q, T_kv) x (B, nh, T_kv, hs) -> (B, nh, T_q, hs)]
+            print(f"error rate: {torch.sum(torch.abs(y-y_test))}")
+        '''
+        y = y.transpose(1, 2).contiguous().view(B, T_q, C) # re-assemble all head outputs side by side
+        y = self.resid_dropout(self.c_proj(y))             # output projection
         return y
 
 class MLP(nn.Module):
@@ -114,6 +134,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    attention_type: str = "standard" # enable key bias / key-value bias in attention mech
 
 class GPT(nn.Module):
 

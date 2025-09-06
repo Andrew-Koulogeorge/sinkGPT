@@ -1,5 +1,7 @@
 .DS_Store
 .idea
+wandb*
+playground.ipynb
 .ipynb_checkpoints/
 .vscode
 __pycache__/
