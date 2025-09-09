@@ -59,8 +59,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, 
                 x: torch.Tensor,
-                return_attn_scores: bool = False, 
-                return_hidden_states: bool = False
+                return_attn_scores: bool = False
                 ):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         T_q = T 
@@ -125,10 +124,9 @@ class Block(nn.Module):
 
     def forward(self, 
                 x: torch.Tensor, 
-                return_attn_scores: bool = False, 
-                return_hidden_states: bool = False):
+                return_attn_scores: bool = False):
         """Forward pass of transformer block w/ functionality to analyze hidden states and attn distributions"""
-        x_updated, attn = self.attn(self.ln_1(x), return_attn_scores, return_hidden_states)
+        x_updated, attn = self.attn(self.ln_1(x), return_attn_scores)
         x = x + x_updated              # compute residual connection
         x = x + self.mlp(self.ln_2(x)) # mlp proc
         return x, attn
@@ -217,9 +215,10 @@ class GPT(nn.Module):
         all_attn = []
         all_hidden = []
         for block in self.transformer.h:
-            x, attns = block(x, return_attn_scores, return_hidden_states)
+            x, attns = block(x, return_attn_scores)
             all_attn.append(attns)
-            # all_hidden.append(hiddens)
+            if return_hidden_states:
+                all_hidden.append(x)
 
         x = self.transformer.ln_f(x)
 
