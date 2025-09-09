@@ -57,7 +57,11 @@ class CausalSelfAttention(nn.Module):
             mask = torch.cat((torch.ones(config.block_size,1), mask), dim=1) # add col of ones for extra bias
         self.register_buffer("bool_mask", (mask == 1))
 
-    def forward(self, x):
+    def forward(self, 
+                x: torch.Tensor,
+                return_attn_scores: bool = False, 
+                return_hidden_states: bool = False
+                ):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         T_q = T 
         T_kv = T
@@ -78,22 +82,21 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
         v = v.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T_q, hs) x (B, nh, hs, T_kv) -> (B, nh, T_q, T_kv)
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=self.bool_mask[:T_q,:T_kv], 
-                                                             dropout_p=self.dropout if self.training else 0, is_causal=False)
-        
-        ''' manual implementation of attention for debugging
-        if True: 
+        # causal self-attention; if we need to keep the attention scores, we cant do flash-attention!
+        if return_attn_scores:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bool_mask.unsqueeze(0).unsqueeze(0)[:,:,:T_q,:T_kv] == False, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y_test = att @ v # (B, nh, T_q, T_kv) x (B, nh, T_kv, hs) -> (B, nh, T_q, hs)]
-            print(f"error rate: {torch.sum(torch.abs(y-y_test))}")
-        '''
+            y = att @ v # (B, nh, T_q, T_kv) x (B, nh, T_kv, hs) -> (B, nh, T_q, hs)]                    
+        else:
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=self.bool_mask[:T_q,:T_kv], 
+                                                             dropout_p=self.dropout if self.training else 0, is_causal=False)
+            att = None
+
         y = y.transpose(1, 2).contiguous().view(B, T_q, C) # re-assemble all head outputs side by side
         y = self.resid_dropout(self.c_proj(y))             # output projection
-        return y
+        return y, att
 
 class MLP(nn.Module):
 
@@ -120,10 +123,15 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, 
+                x: torch.Tensor, 
+                return_attn_scores: bool = False, 
+                return_hidden_states: bool = False):
+        """Forward pass of transformer block w/ functionality to analyze hidden states and attn distributions"""
+        x_updated, attn = self.attn(self.ln_1(x), return_attn_scores, return_hidden_states)
+        x = x + x_updated              # compute residual connection
+        x = x + self.mlp(self.ln_2(x)) # mlp proc
+        return x, attn
 
 @dataclass
 class GPTConfig:
@@ -188,7 +196,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, 
+                targets=None, 
+                return_attn_scores: bool = False, 
+                return_hidden_states: bool = False):
+        """
+        Updating forward pass to return attention distribution and hidden representations
+        for attention sink analysis
+        """
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -197,9 +212,15 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb + pos_emb) # dropout on embeddings
+        
+        all_attn = []
+        all_hidden = []
         for block in self.transformer.h:
-            x = block(x)
+            x, attns = block(x, return_attn_scores, return_hidden_states)
+            all_attn.append(attns)
+            # all_hidden.append(hiddens)
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -210,8 +231,10 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
-        return logits, loss
+        
+        output = {"logits":logits, "loss":loss, "all_attn": all_attn, "all_hidden": all_hidden}
+        return output
+        # return logits, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
