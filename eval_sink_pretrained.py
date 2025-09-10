@@ -5,7 +5,7 @@ Measure attention sink frequency within the heads of a pre-trained autoregressiv
 import torch
 import numpy as np
 import os
-from model import GPT, GPTConfig
+from sinkGPT.model_base import GPT, GPTConfig
 
 DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/data/user_data/akouloge/attention_sinks/openwebtext"

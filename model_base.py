@@ -49,12 +49,6 @@ class CausalSelfAttention(nn.Module):
     
         # base causal mask to ensure that attention is only applied to the left in the input sequence
         mask = torch.tril(torch.ones(config.block_size, config.block_size))
-        kv_bias = (self.attention_type in ["key_bias", "key_value_bias"])
-        if kv_bias:
-            self.key_bias = nn.Parameter(torch.zeros(self.n_embd), requires_grad=True)
-            if self.attention_type == "key_value_bias":
-                self.value_bias = nn.Parameter(torch.zeros(self.n_embd), requires_grad=True)           
-            mask = torch.cat((torch.ones(config.block_size,1), mask), dim=1) # add col of ones for extra bias
         self.register_buffer("bool_mask", (mask == 1))
 
     def forward(self, 
@@ -67,16 +61,6 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) # 3x(B,T,n_embed)
-        if self.attention_type in ["key_bias", "key_value_bias"]:
-            key_bias = self.key_bias.unsqueeze(0).unsqueeze(0).expand(B,1,C)
-            if self.attention_type == "key_value_bias":
-                value_bias = self.value_bias.unsqueeze(0).unsqueeze(0).expand(B,1,C)
-            else:
-                value_bias = torch.zeros(size=(B,1,C), device=x.device)
-            k = torch.cat((key_bias, k), dim=1)
-            v = torch.cat((value_bias, v), dim=1)
-            T_kv += 1
-        
         q = q.view(B, T_q, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_q, hs)
         k = k.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
         v = v.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
@@ -140,9 +124,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    attention_type: str = "standard" # enable key bias / key-value bias in attention mech
 
-class GPT(nn.Module):
+class GPTBase(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -272,7 +255,7 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        model = GPT(config)
+        model = GPTBase(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param

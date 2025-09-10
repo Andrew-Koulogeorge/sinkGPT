@@ -27,7 +27,10 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from sinkGPT.model_base import GPTConfig
+from sinkGPT.model_base import GPTBase
+from sinkGPT.model_kbias import GPTKbias
+from sinkGPT.model_kvbias import GPTKVbias
 
 # loc where data is mounted on cluster
 DATA_DIR = "/data/user_data/akouloge/attention_sinks"
@@ -36,7 +39,7 @@ DATA_DIR = "/data/user_data/akouloge/attention_sinks"
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 500
+eval_interval = 250
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -45,7 +48,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'attention_sinks'
-wandb_run_name='gpt2_test'
+wandb_run_name='gpt2_base'
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -75,6 +78,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+attention_type = "base" # signal 
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -157,7 +161,16 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    
+    if attention_type == "base":
+        model = GPTBase(gptconf)
+    elif attention_type == "k_bias":
+        model = GPTKbias(gptconf)
+    elif attention_type == "kv_bias":
+        model = GPTKVbias(gptconf)
+    else:
+        raise RuntimeError("Ensure that the attention type is valid")
+        
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -170,7 +183,16 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    
+    if attention_type == "base":
+        model = GPTBase(gptconf)
+    elif attention_type == "k_bias":
+        model = GPTKbias(gptconf)
+    elif attention_type == "kv_bias":
+        model = GPTKVbias(gptconf)
+    else:
+        raise RuntimeError("Ensure that the attention type is valid")
+    
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -185,7 +207,7 @@ elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    model = GPTBase.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
@@ -225,7 +247,9 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                # logits, loss = model(X, Y)
+                output = model(X, Y)
+                logits, loss = output["logits"], output["loss"]
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -302,7 +326,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            output = model(X, Y)
+            logits, loss = output["logits"], output["loss"]
+            # logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

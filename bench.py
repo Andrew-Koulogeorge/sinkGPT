@@ -6,7 +6,7 @@ from contextlib import nullcontext
 import numpy as np
 import time
 import torch
-from model import GPTConfig, GPT
+from sinkGPT.model_base import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 batch_size = 12
@@ -83,7 +83,9 @@ if profile:
         X, Y = get_batch('train')
         for k in range(num_steps):
             with ctx:
-                logits, loss = model(X, Y)
+                # logits, loss = model(X, Y)
+                output = model(X, Y)
+                logits, loss = output["logits"], output["loss"]
             X, Y = get_batch('train')
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
