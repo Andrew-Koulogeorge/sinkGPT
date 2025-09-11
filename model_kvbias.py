@@ -45,13 +45,12 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.attention_type = config.attention_type
     
         # base causal mask to ensure that attention is only applied to the left in the input sequence
         mask = torch.tril(torch.ones(config.block_size, config.block_size))
         mask = torch.cat((torch.ones(config.block_size,1), mask), dim=1) # add col of ones for extra bias
         self.register_buffer("bool_mask", (mask == 1))
-        
+
         self.key_bias = nn.Parameter(torch.zeros(self.n_embd), requires_grad=True)
         self.value_bias = nn.Parameter(torch.zeros(self.n_embd), requires_grad=True)   
 

@@ -5,10 +5,6 @@ References:
 https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-
-
-Updating Model definition to include: 
-1) variations of the attention mechanism that have been shown to illiminate attention sinks
 """
 
 import math
@@ -45,40 +41,45 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.attention_type = config.attention_type
-    
-        # base causal mask to ensure that attention is only applied to the left in the input sequence
-        mask = torch.tril(torch.ones(config.block_size, config.block_size))
-        self.register_buffer("bool_mask", (mask == 1))
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            
+        # need this bias always if we want to analyze the attention scores of the model
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, 
-                x: torch.Tensor,
-                return_attn_scores: bool = False
-                ):
+    def forward(self, x,
+                return_attn_scores: bool = False):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        T_q = T 
-        T_kv = T
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) # 3x(B,T,n_embed)
-        q = q.view(B, T_q, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_q, hs)
-        k = k.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
-        v = v.view(B, T_kv, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T_kv, hs)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; if we need to keep the attention scores, we cant do flash-attention!
-        if return_attn_scores:
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash and not return_attn_scores:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bool_mask.unsqueeze(0).unsqueeze(0)[:,:,:T_q,:T_kv] == False, float('-inf'))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T_q, T_kv) x (B, nh, T_kv, hs) -> (B, nh, T_q, hs)]                    
-        else:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=self.bool_mask[:T_q,:T_kv], 
-                                                             dropout_p=self.dropout if self.training else 0, is_causal=False)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        
+        # return att scores from forward pass
+        if not return_attn_scores:
             att = None
 
-        y = y.transpose(1, 2).contiguous().view(B, T_q, C) # re-assemble all head outputs side by side
-        y = self.resid_dropout(self.c_proj(y))             # output projection
         return y, att
 
 class MLP(nn.Module):
@@ -106,6 +107,10 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
+    # def forward(self, x):
+    #     x = x + self.attn(self.ln_1(x))
+    #     x = x + self.mlp(self.ln_2(x))
+    #     return x
     def forward(self, 
                 x: torch.Tensor, 
                 return_attn_scores: bool = False):
@@ -178,13 +183,9 @@ class GPTBase(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, 
-                targets=None, 
+                targets=None,
                 return_attn_scores: bool = False, 
                 return_hidden_states: bool = False):
-        """
-        Updating forward pass to return attention distribution and hidden representations
-        for attention sink analysis
-        """
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -193,8 +194,11 @@ class GPTBase(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb) # dropout on embeddings
-        
+        x = self.transformer.drop(tok_emb + pos_emb)
+
+        # for block in self.transformer.h:
+        #     x = block(x)
+
         all_attn = []
         all_hidden = []
         for block in self.transformer.h:
@@ -202,7 +206,7 @@ class GPTBase(nn.Module):
             all_attn.append(attns)
             if return_hidden_states:
                 all_hidden.append(x)
-
+        
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -213,10 +217,9 @@ class GPTBase(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-        
+        # return logits, loss
         output = {"logits":logits, "loss":loss, "all_attn": all_attn, "all_hidden": all_hidden}
         return output
-        # return logits, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

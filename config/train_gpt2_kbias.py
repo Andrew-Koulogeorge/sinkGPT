@@ -4,7 +4,7 @@
 
 wandb_log = True
 wandb_project = 'attention_sinks'
-wandb_run_name='gpt2-124M_base'
+wandb_run_name='gpt2-124M_kbias'
 
 # these make the total batch size be ~0.5M
 # b batch size * 1024 block size * 5 gradaccum * x GPUs = 
@@ -17,9 +17,10 @@ max_iters = 10_000
 lr_decay_iters = 10_000
 
 # eval stuff
-eval_interval = 250
+eval_interval = 100
 eval_iters = 200
 log_interval = 10
 
 # weight decay
 weight_decay = 1e-1
+attention_type="k_bias"

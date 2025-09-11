@@ -45,7 +45,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.attention_type = config.attention_type
     
         # base causal mask to ensure that attention is only applied to the left in the input sequence
         mask = torch.tril(torch.ones(config.block_size, config.block_size))

@@ -27,10 +27,10 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from sinkGPT.model_base import GPTConfig
-from sinkGPT.model_base import GPTBase
-from sinkGPT.model_kbias import GPTKbias
-from sinkGPT.model_kvbias import GPTKVbias
+from model_base import GPTConfig
+from model_base import GPTBase
+from model_kbias import GPTKbias
+from model_kvbias import GPTKVbias
 
 # loc where data is mounted on cluster
 DATA_DIR = "/data/user_data/akouloge/attention_sinks"

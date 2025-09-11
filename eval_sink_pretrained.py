@@ -5,7 +5,7 @@ Measure attention sink frequency within the heads of a pre-trained autoregressiv
 import torch
 import numpy as np
 import os
-from sinkGPT.model_base import GPT, GPTConfig
+from model_base import GPTBase, GPTConfig
 
 DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/data/user_data/akouloge/attention_sinks/openwebtext"
@@ -15,8 +15,8 @@ def load_model(state_dict_path:str = None):
     Load pretrained model based on state_dict. If no path is passed in, load fresh model
     """
     if not state_dict_path:
-        config_normal = GPTConfig(n_layer=2)
-        model = GPT(config_normal)
+        print(f"downloading gpt2 model from hugging face...")
+        model = GPTBase.from_pretrained(model_type="gpt2")
     return model 
 
 def get_batch(global_pointer:int = 0,
@@ -51,7 +51,7 @@ def evaluate_sinks(state_dict_path: str,
     """
     bare-bones implementation; compute attention sink existance on 1 batch of eval data
     """
-    NUM_BATCHES = 5
+    NUM_BATCHES = 2
 
     model = load_model(state_dict_path)    
     all_attns = []           # all_attn stores list of (B x Layers x H x N x N')       
